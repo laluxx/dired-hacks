@@ -127,6 +127,37 @@ when `dired-narrow-exit-when-one-left' and `dired-narrow-enable-blinking' are tr
   :group 'dired-narrow)
 
 
+;;; HACKS
+
+(defcustom dired-narrow-auto-search-single-dir t
+  "If non-nil, automatically start a new search when entering a directory
+that was selected as a single match."
+  :type 'boolean
+  :group 'dired-narrow)
+
+;; Add variables to track state
+(defvar dired-narrow--single-file-exit nil
+  "Non-nil if we exited minibuffer due to single file match.")
+
+(defvar dired-narrow--current-filter nil
+  "Store the current filter for use in recursive directory searches.")
+
+(defvar dired-narrow--current-filter-fn nil
+  "Store the current filter function for recursive directory searches.")
+
+(defun dired-narrow--resume-search ()
+  "Resume search in a new directory with empty filter."
+  (when dired-narrow--current-filter-fn 
+    ;; Start a new search with empty initial input
+    (dired-narrow--internal dired-narrow--current-filter-fn nil)))
+
+;; (defun dired-narrow--resume-search ()
+;;   "Resume search in a new directory with previous filter."
+;;   (when (and dired-narrow--current-filter
+;;              dired-narrow--current-filter-fn)
+;;     (dired-narrow--internal dired-narrow--current-filter-fn
+;;                             dired-narrow--current-filter)))
+
 ;; Utils
 
 ;; this is `gnus-remove-text-with-property'
@@ -209,12 +240,16 @@ Return the count of visible files that are left after update."
 
 (add-hook 'minibuffer-setup-hook 'dired-narrow--minibuffer-setup)
 
+
 (defun dired-narrow--live-update ()
   "Update the dired buffer based on the contents of the minibuffer."
   (when dired-narrow-buffer
     (let ((current-filter (minibuffer-contents-no-properties))
           visible-files-cnt)
       (with-current-buffer dired-narrow-buffer
+        ;; Store current filter for potential recursive use
+        (setq dired-narrow--current-filter current-filter)
+        
         (setq visible-files-cnt
               (unless (equal current-filter dired-narrow--minibuffer-content)
                 (dired-narrow--update current-filter)))
@@ -223,54 +258,67 @@ Return the count of visible files that are left after update."
         (setq dired-narrow--current-file (dired-utils-get-filename))
         (set-window-point (get-buffer-window (current-buffer)) (point))
 
-        (when (and dired-narrow-exit-when-one-left
-                   visible-files-cnt
+        ;; Handle single file case
+        (when (and visible-files-cnt
                    (= visible-files-cnt 1))
-          (when dired-narrow-enable-blinking
-              (dired-narrow--blink-current-file))
+          (setq dired-narrow--single-file-exit t)
           (exit-minibuffer))))))
 
-(defun dired-narrow--internal (filter-function)
+(defun dired-narrow--internal (filter-function &optional initial-input)
   "Narrow a dired buffer to the files matching a filter.
 
 The function FILTER-FUNCTION is called on each line: if it
 returns non-nil, the line is kept, otherwise it is removed.  The
 function takes one argument, which is the current filter string
-read from minibuffer."
+read from minibuffer.
+
+Optional INITIAL-INPUT is the initial content of the minibuffer."
   (let ((dired-narrow-buffer (current-buffer))
         (dired-narrow-filter-function filter-function)
         (disable-narrow nil))
+    ;; Store the filter function for potential recursive use
+    (setq dired-narrow--current-filter-fn filter-function)
+    ;; Reset the single file exit flag
+    (setq dired-narrow--single-file-exit nil)
     (unwind-protect
         (progn
           (dired-narrow-mode 1)
           (add-to-invisibility-spec :dired-narrow)
-          (setq disable-narrow (read-from-minibuffer
-                                (pcase dired-narrow-filter-function
-                                  ('dired-narrow--regexp-filter
-                                   "Regex Filter:\s")
-                                  ('dired-narrow--fuzzy-filter
-                                   "Fuzzy Filter:\s")
-                                  (t "Filter:\s"))
-                                nil dired-narrow-map))
+          (setq disable-narrow 
+                (read-from-minibuffer
+                 (pcase dired-narrow-filter-function
+                   ('dired-narrow--regexp-filter
+                    "Regex Filter: ")
+                   ('dired-narrow--fuzzy-filter
+                    "Fuzzy Filter: ")
+                   (t "Filter: "))
+                 initial-input
+                 dired-narrow-map))
           (let ((inhibit-read-only t))
             (dired-narrow--remove-text-with-property :dired-narrow))
           ;; If the file no longer exists, we can't do anything, so
           ;; set to nil
           (unless (dired-utils-goto-line dired-narrow--current-file)
             (setq dired-narrow--current-file nil)))
+      ;; Always cleanup in unwind-protect
       (with-current-buffer dired-narrow-buffer
         (unless disable-narrow (dired-narrow-mode -1))
         (remove-from-invisibility-spec :dired-narrow)
-        (dired-narrow--restore))
-      (cond
-       ((equal disable-narrow "dired-narrow-enter-directory")
-        (dired-narrow-find-file)
-        (dired-narrow--internal filter-function))
-       (t
-        (when (and disable-narrow
-                   dired-narrow--current-file
-                   dired-narrow-exit-action)
-          (funcall dired-narrow-exit-action)))))))
+        (when dired-narrow--single-file-exit
+          ;; First restore and revert to get icons back
+          (dired-narrow--restore)
+          (revert-buffer)
+          ;; Store if this was a directory before we open it
+          (let ((was-directory (file-directory-p (dired-get-filename))))
+            ;; Then open the file/directory
+            (dired-narrow-find-file)
+            ;; If it was a directory and auto-search is enabled, start a new search
+            (when (and was-directory 
+                       dired-narrow-auto-search-single-dir)
+              (run-with-timer 0 nil #'dired-narrow--resume-search))))
+        (unless dired-narrow--single-file-exit
+          ;; In all other cases, just restore
+          (dired-narrow--restore))))))
 
 
 ;; Interactive
@@ -340,11 +388,7 @@ For example \"foo bar\" matches filename \"bar-and-foo.el\"."
 
 ;;;###autoload
 (defun dired-narrow-fuzzy ()
-  "Narrow a dired buffer to the files matching a fuzzy string.
-
-A fuzzy string is constructed from the filter string by inserting
-\".*\" between each letter.  This is then matched as regular
-expression against the file name."
+  "Narrow a dired buffer to the files matching a fuzzy string."
   (interactive)
   (dired-narrow--internal 'dired-narrow--fuzzy-filter))
 
